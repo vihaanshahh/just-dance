@@ -31,10 +31,13 @@ import numpy as np
 
 from ..core.video_loader import YouTubeDownloader, VideoReader
 from ..core.pipeline import ProcessingPipeline, PipelineConfig
-from ..rendering.silhouette import SilhouetteConfig
+from ..core.stabilizer import StabilizerConfig
+from ..pose.densepose_detector import DensePoseConfig
+from ..rendering.mannequin import MannequinConfig
 from ..rendering.glove import GloveConfig
 from ..rendering.ribbon import RibbonConfig
 from ..rendering.compositor import BackgroundConfig
+from ..rendering.clothing import ClothingConfig
 
 
 class DownloadWorker(QObject):
@@ -150,17 +153,15 @@ class SettingsPanel(QWidget):
         title.setStyleSheet("font-size: 16px; font-weight: bold;")
         layout.addWidget(title)
 
-        # Silhouette settings
-        silhouette_group = QGroupBox("Silhouette")
-        silhouette_layout = QVBoxLayout(silhouette_group)
+        # Mannequin settings
+        mannequin_group = QGroupBox("3D Mannequin")
+        mannequin_layout = QVBoxLayout(mannequin_group)
 
-        self.silhouette_thickness = QSlider(Qt.Horizontal)
-        self.silhouette_thickness.setRange(15, 50)
-        self.silhouette_thickness.setValue(28)
-        silhouette_layout.addWidget(QLabel("Thickness"))
-        silhouette_layout.addWidget(self.silhouette_thickness)
+        self.mannequin_shadow = QCheckBox("Drop Shadow")
+        self.mannequin_shadow.setChecked(True)
+        mannequin_layout.addWidget(self.mannequin_shadow)
 
-        layout.addWidget(silhouette_group)
+        layout.addWidget(mannequin_group)
 
         # Glove settings
         glove_group = QGroupBox("Glove Effect")
@@ -210,28 +211,119 @@ class SettingsPanel(QWidget):
 
         layout.addWidget(bg_group)
 
+        # Stabilization settings
+        stab_group = QGroupBox("Stabilization")
+        stab_layout = QVBoxLayout(stab_group)
+
+        self.center_person = QCheckBox("Center Person")
+        self.center_person.setChecked(False)
+        stab_layout.addWidget(self.center_person)
+
+        self.zoom_factor = QSlider(Qt.Horizontal)
+        self.zoom_factor.setRange(10, 20)  # 1.0 to 2.0 (stored as 10x)
+        self.zoom_factor.setValue(13)  # 1.3
+        stab_layout.addWidget(QLabel("Zoom Factor"))
+        stab_layout.addWidget(self.zoom_factor)
+
+        self.smoothing_radius = QSlider(Qt.Horizontal)
+        self.smoothing_radius.setRange(5, 60)
+        self.smoothing_radius.setValue(30)
+        stab_layout.addWidget(QLabel("Smoothing Radius"))
+        stab_layout.addWidget(self.smoothing_radius)
+
+        layout.addWidget(stab_group)
+
+        # Clothing overlay settings
+        clothing_group = QGroupBox("Clothing Overlay")
+        clothing_layout = QVBoxLayout(clothing_group)
+
+        self.clothing_enabled = QCheckBox("Enable Clothing Overlay")
+        self.clothing_enabled.setChecked(False)
+        clothing_layout.addWidget(self.clothing_enabled)
+
+        # Shirt texture picker
+        shirt_row = QHBoxLayout()
+        self.shirt_texture_path = QLineEdit()
+        self.shirt_texture_path.setPlaceholderText("Default shirt texture")
+        self.shirt_texture_path.setStyleSheet(
+            "QLineEdit { padding: 4px; background: #3d3d5c; color: white; border: none; border-radius: 3px; }"
+        )
+        self.shirt_browse_btn = QPushButton("...")
+        self.shirt_browse_btn.setFixedWidth(30)
+        self.shirt_browse_btn.clicked.connect(self._browse_shirt_texture)
+        shirt_row.addWidget(QLabel("Shirt"))
+        shirt_row.addWidget(self.shirt_texture_path, stretch=1)
+        shirt_row.addWidget(self.shirt_browse_btn)
+        clothing_layout.addLayout(shirt_row)
+
+        # Pants texture picker
+        pants_row = QHBoxLayout()
+        self.pants_texture_path = QLineEdit()
+        self.pants_texture_path.setPlaceholderText("Default pants texture")
+        self.pants_texture_path.setStyleSheet(
+            "QLineEdit { padding: 4px; background: #3d3d5c; color: white; border: none; border-radius: 3px; }"
+        )
+        self.pants_browse_btn = QPushButton("...")
+        self.pants_browse_btn.setFixedWidth(30)
+        self.pants_browse_btn.clicked.connect(self._browse_pants_texture)
+        pants_row.addWidget(QLabel("Pants"))
+        pants_row.addWidget(self.pants_texture_path, stretch=1)
+        pants_row.addWidget(self.pants_browse_btn)
+        clothing_layout.addLayout(pants_row)
+
+        self.clothing_opacity = QSlider(Qt.Horizontal)
+        self.clothing_opacity.setRange(20, 100)
+        self.clothing_opacity.setValue(85)
+        clothing_layout.addWidget(QLabel("Opacity"))
+        clothing_layout.addWidget(self.clothing_opacity)
+
+        layout.addWidget(clothing_group)
+
         layout.addStretch()
 
         # Connect signals
         self._connect_signals()
 
+    def _browse_shirt_texture(self):
+        """Open file dialog for shirt texture."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Shirt Texture", "", "Images (*.png *.jpg *.bmp);;All Files (*)"
+        )
+        if path:
+            self.shirt_texture_path.setText(path)
+            self.settings_changed.emit()
+
+    def _browse_pants_texture(self):
+        """Open file dialog for pants texture."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Pants Texture", "", "Images (*.png *.jpg *.bmp);;All Files (*)"
+        )
+        if path:
+            self.pants_texture_path.setText(path)
+            self.settings_changed.emit()
+
     def _connect_signals(self):
         """Connect all settings to emit settings_changed."""
-        self.silhouette_thickness.valueChanged.connect(self.settings_changed.emit)
+        self.mannequin_shadow.stateChanged.connect(self.settings_changed.emit)
         self.glove_glow.valueChanged.connect(self.settings_changed.emit)
         self.glove_pulse.stateChanged.connect(self.settings_changed.emit)
         self.ribbon_enabled.stateChanged.connect(self.settings_changed.emit)
         self.ribbon_length.valueChanged.connect(self.settings_changed.emit)
         self.ribbon_opacity.valueChanged.connect(self.settings_changed.emit)
         self.bg_style.currentIndexChanged.connect(self.settings_changed.emit)
+        self.center_person.stateChanged.connect(self.settings_changed.emit)
+        self.zoom_factor.valueChanged.connect(self.settings_changed.emit)
+        self.smoothing_radius.valueChanged.connect(self.settings_changed.emit)
+        self.clothing_enabled.stateChanged.connect(self.settings_changed.emit)
+        self.clothing_opacity.valueChanged.connect(self.settings_changed.emit)
 
     def get_config(self) -> PipelineConfig:
         """Get current settings as PipelineConfig."""
         bg_styles = ["gradient", "solid", "original"]
 
         return PipelineConfig(
-            silhouette=SilhouetteConfig(
-                body_thickness=self.silhouette_thickness.value(),
+            mannequin=MannequinConfig(
+                shadow_enabled=self.mannequin_shadow.isChecked(),
             ),
             glove=GloveConfig(
                 glow_intensity=self.glove_glow.value() / 100.0,
@@ -243,6 +335,20 @@ class SettingsPanel(QWidget):
             ),
             background=BackgroundConfig(
                 style=bg_styles[self.bg_style.currentIndex()],
+            ),
+            stabilizer=StabilizerConfig(
+                enabled=self.center_person.isChecked(),
+                zoom_factor=self.zoom_factor.value() / 10.0,
+                smoothing_radius=self.smoothing_radius.value(),
+            ),
+            densepose=DensePoseConfig(
+                enabled=self.clothing_enabled.isChecked(),
+            ),
+            clothing=ClothingConfig(
+                enabled=self.clothing_enabled.isChecked(),
+                shirt_texture=self.shirt_texture_path.text().strip(),
+                pants_texture=self.pants_texture_path.text().strip(),
+                opacity=self.clothing_opacity.value() / 100.0,
             ),
         )
 

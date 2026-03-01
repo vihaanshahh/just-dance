@@ -9,18 +9,15 @@ import sys
 import numpy as np
 import cv2
 
-# Use spawn on macOS for MediaPipe compatibility
-if sys.platform == 'darwin':
-    try:
-        mp.set_start_method('spawn', force=False)
-    except RuntimeError:
-        pass  # Already set
 
 from ..pose.detector import PoseDetector
 from ..pose.smoother import MotionSmoother
-from ..rendering.silhouette import SilhouetteRenderer, SilhouetteConfig
+from ..rendering.mannequin import MannequinRenderer, MannequinConfig
 from ..rendering.glove import GloveRenderer, GloveConfig
 from ..rendering.compositor import Compositor, BackgroundConfig
+from ..rendering.clothing import ClothingRenderer, ClothingConfig
+from ..pose.densepose_detector import DensePoseDetector, DensePoseConfig
+from .stabilizer import PersonCenteringStabilizer, StabilizerConfig
 from .video_loader import VideoReader
 from .video_exporter import VideoWriter, ExportConfig
 
@@ -40,9 +37,16 @@ class PipelineConfig:
     measurement_noise: float = 0.08
 
     # Rendering
-    silhouette: SilhouetteConfig = field(default_factory=SilhouetteConfig)
+    mannequin: MannequinConfig = field(default_factory=MannequinConfig)
     glove: GloveConfig = field(default_factory=GloveConfig)
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
+
+    # Stabilization
+    stabilizer: StabilizerConfig = field(default_factory=StabilizerConfig)
+
+    # DensePose + Clothing
+    densepose: DensePoseConfig = field(default_factory=DensePoseConfig)
+    clothing: ClothingConfig = field(default_factory=ClothingConfig)
 
     # Export
     export: ExportConfig = field(default_factory=ExportConfig)
@@ -50,20 +54,20 @@ class PipelineConfig:
 
 def _process_frame_batch(args):
     """Process a batch of frames (runs in separate process)."""
-    frames, frame_indices, config_dict, frame_size = args
+    frames, frame_indices, config_dict, frame_size, clothing_layers = args
 
     # Create components for this worker
     detector = PoseDetector(
         model_complexity=config_dict['model_complexity'],
         detection_scale=config_dict['detection_scale'],
-        enable_segmentation=True,
+        enable_segmentation=False,
     )
     smoother = MotionSmoother(
         process_noise=config_dict['process_noise'],
         measurement_noise=config_dict['measurement_noise'],
     )
 
-    silhouette_renderer = SilhouetteRenderer()
+    mannequin_renderer = MannequinRenderer()
     glove_renderer = GloveRenderer()
     compositor = Compositor()
 
@@ -95,7 +99,13 @@ def _process_frame_batch(args):
         background = compositor.create_background(frame_size, frame)
         layers = []
 
-        layers.append(silhouette_renderer.render(smoothed, frame_size, seg_mask))
+        layers.append(mannequin_renderer.render(smoothed, frame_size))
+
+        # Insert pre-rendered clothing layer (from DensePose pre-pass)
+        batch_local_idx = i
+        if clothing_layers is not None and clothing_layers[batch_local_idx] is not None:
+            layers.append(clothing_layers[batch_local_idx])
+
         layers.append(glove_renderer.render(smoothed, frame_size, frame_idx / 30.0))
 
         rendered = compositor.composite(background, layers)
@@ -136,6 +146,27 @@ class ProcessingPipeline:
             total_frames = len(frames)
             print(f" {total_frames} frames", flush=True)
 
+            # --- Pre-pass 1: Person Centering / Stabilization ---
+            if self.config.stabilizer.enabled:
+                print("    Stabilizing (centering person)...", flush=True)
+                stabilizer = PersonCenteringStabilizer(self.config.stabilizer)
+                transforms = stabilizer.compute_transforms(frames, frame_size)
+                frames = [
+                    stabilizer.apply_transform(f, t, frame_size)
+                    for f, t in zip(frames, transforms)
+                ]
+
+            # --- Pre-pass 2: DensePose + Clothing (single-process, GPU) ---
+            clothing_layers = [None] * total_frames
+            if self.config.clothing.enabled:
+                print("    Computing DensePose clothing overlay...", flush=True)
+                dp_detector = DensePoseDetector(self.config.densepose)
+                clothing_renderer = ClothingRenderer(self.config.clothing)
+                for i, frame in enumerate(frames):
+                    iuv = dp_detector.detect(frame)
+                    clothing_layers[i] = clothing_renderer.render(iuv, frame_size)
+                dp_detector.close()
+
             # Split into batches for parallel processing
             num_workers = min(self.config.num_workers, max(1, total_frames // 100))
             batch_size = (total_frames + num_workers - 1) // num_workers
@@ -145,24 +176,49 @@ class ProcessingPipeline:
                 end = min(i + batch_size, total_frames)
                 batch_frames = frames[i:end]
                 batch_indices = list(range(i, end))
+                batch_clothing = clothing_layers[i:end]
                 batches.append((batch_frames, batch_indices, {
                     'model_complexity': self.config.model_complexity,
                     'detection_scale': self.config.detection_scale,
                     'frame_skip': self.config.frame_skip,
                     'process_noise': self.config.process_noise,
                     'measurement_noise': self.config.measurement_noise,
-                }, frame_size))
+                }, frame_size, batch_clothing))
 
-            # Process batches in parallel
-            print(f"    Processing with {num_workers} workers...", flush=True)
+            # Process batches.
+            # MediaPipe's TFLite runtime is not fork-safe — forked children
+            # inherit corrupted native state causing malloc crashes.  If
+            # MediaPipe was already loaded in this process (e.g. by the
+            # stabilizer pre-pass), we must avoid fork and process
+            # sequentially.  Otherwise we can safely use fork-based
+            # multiprocessing.
+            mediapipe_loaded = 'mediapipe' in sys.modules
+            use_multiprocessing = num_workers > 1 and not mediapipe_loaded
+
+            if use_multiprocessing:
+                print(f"    Processing with {num_workers} workers...", flush=True)
+            else:
+                effective = num_workers if not mediapipe_loaded else 1
+                print(f"    Processing with {effective} worker(s)...", flush=True)
+
             all_results = {}
             completed = 0
 
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = {executor.submit(_process_frame_batch, batch): i for i, batch in enumerate(batches)}
+            if use_multiprocessing:
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    futures = {executor.submit(_process_frame_batch, batch): i for i, batch in enumerate(batches)}
 
-                for future in as_completed(futures):
-                    results = future.result()
+                    for future in as_completed(futures):
+                        results = future.result()
+                        for frame_idx, rendered in results:
+                            all_results[frame_idx] = rendered
+                            completed += 1
+
+                            if progress_callback and completed % 50 == 0:
+                                progress_callback(completed / total_frames * 100, completed, total_frames)
+            else:
+                for batch in batches:
+                    results = _process_frame_batch(batch)
                     for frame_idx, rendered in results:
                         all_results[frame_idx] = rendered
                         completed += 1
