@@ -1,4 +1,4 @@
-"""Clean white body silhouette renderer with shadow."""
+"""Clean body silhouette renderer using segmentation mask."""
 
 import numpy as np
 import cv2
@@ -12,130 +12,124 @@ class SilhouetteConfig:
 
     color: Tuple[int, int, int] = (255, 255, 255)  # White
     shadow_color: Tuple[int, int, int] = (40, 40, 50)  # Dark shadow
-    shadow_offset: Tuple[int, int] = (8, 8)  # Shadow offset (x, y)
-    shadow_blur: int = 15
-    body_thickness: int = 22
-    joint_radius: int = 11
-    edge_blur: int = 2
+    shadow_offset: Tuple[int, int] = (8, 8)
+    shadow_blur: int = 21
+    edge_blur: int = 3
+    mask_threshold: float = 0.5
+    # Morphological cleanup
+    morph_close_size: int = 9
+    morph_open_size: int = 5
+    # Glow
+    glow_size: int = 25
+    glow_intensity: float = 0.4
+    glow_color: Tuple[int, int, int] = (180, 200, 255)  # Soft blue-white
 
 
 class SilhouetteRenderer:
-    """Renders clean white body silhouette with shadow."""
-
-    BODY_CONNECTIONS = [
-        (11, 12),  # shoulders
-        (11, 23), (12, 24),  # torso sides
-        (23, 24),  # hips
-        (11, 13), (13, 15),  # left arm
-        (12, 14), (14, 16),  # right arm
-        (23, 25), (25, 27),  # left leg
-        (24, 26), (26, 28),  # right leg
-    ]
-
-    JOINTS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
-
-    THICKNESS = {
-        (11, 12): 1.4, (23, 24): 1.3,  # shoulders/hips wider
-        (11, 23): 1.2, (12, 24): 1.2,  # torso
-        (11, 13): 0.9, (12, 14): 0.9,  # upper arms
-        (13, 15): 0.75, (14, 16): 0.75,  # forearms
-        (23, 25): 1.0, (24, 26): 1.0,  # thighs
-        (25, 27): 0.8, (26, 28): 0.8,  # shins
-    }
+    """Renders clean body silhouette from segmentation mask."""
 
     def __init__(self, config: Optional[SilhouetteConfig] = None):
         self.config = config or SilhouetteConfig()
 
-    def render(self, keypoints: np.ndarray, frame_size: Tuple[int, int]) -> np.ndarray:
-        """Render silhouette with shadow."""
+    def render(
+        self,
+        keypoints: np.ndarray,
+        frame_size: Tuple[int, int],
+        seg_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Render silhouette from segmentation mask with shadow and glow."""
         height, width = frame_size
         layer = np.zeros((height, width, 4), dtype=np.uint8)
 
-        # Draw shadow first (offset and blurred)
-        shadow_layer = np.zeros((height, width, 4), dtype=np.uint8)
-        self._draw_body(shadow_layer, keypoints, width, height, is_shadow=True)
+        if seg_mask is None:
+            return layer
 
-        # Blur the shadow
-        if self.config.shadow_blur > 0:
-            k = self.config.shadow_blur * 2 + 1
-            shadow_layer = cv2.GaussianBlur(shadow_layer, (k, k), 0)
+        # Clean up the mask
+        mask = self._clean_mask(seg_mask, width, height)
 
-        # Composite shadow onto layer
-        self._composite(layer, shadow_layer)
+        # Draw shadow (offset + blurred copy)
+        self._draw_shadow(layer, mask, width, height)
 
-        # Draw main body on top
-        self._draw_body(layer, keypoints, width, height, is_shadow=False)
+        # Draw outer glow
+        self._draw_glow(layer, mask)
 
-        # Slight edge softening
-        if self.config.edge_blur > 0:
-            k = self.config.edge_blur * 2 + 1
-            alpha = layer[:, :, 3]
-            layer[:, :, 3] = cv2.GaussianBlur(alpha, (k, k), 0)
+        # Draw the main body
+        self._draw_body(layer, mask)
 
         return layer
 
-    def _draw_body(
-        self,
-        layer: np.ndarray,
-        keypoints: np.ndarray,
-        width: int,
-        height: int,
-        is_shadow: bool,
-    ):
-        """Draw the body segments and joints."""
-        if is_shadow:
-            color = self.config.shadow_color
-            offset = self.config.shadow_offset
-            alpha = 180
-        else:
-            color = self.config.color
-            offset = (0, 0)
-            alpha = 255
+    def _clean_mask(self, seg_mask: np.ndarray, width: int, height: int) -> np.ndarray:
+        """Threshold and morphologically clean the segmentation mask."""
+        # Resize if needed
+        if seg_mask.shape[:2] != (height, width):
+            seg_mask = cv2.resize(seg_mask, (width, height), interpolation=cv2.INTER_LINEAR)
 
-        color_bgra = (color[2], color[1], color[0], alpha)
+        # Threshold to binary
+        mask = (seg_mask > self.config.mask_threshold).astype(np.uint8) * 255
 
-        # Draw segments
-        for start_idx, end_idx in self.BODY_CONNECTIONS:
-            if keypoints[start_idx, 2] < 0.3 or keypoints[end_idx, 2] < 0.3:
-                continue
+        # Close small gaps (fills holes in the body)
+        k = self.config.morph_close_size
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
 
-            pt1 = self._to_pixel(keypoints[start_idx], width, height, offset)
-            pt2 = self._to_pixel(keypoints[end_idx], width, height, offset)
+        # Open to remove small noise blobs
+        k = self.config.morph_open_size
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
 
-            thickness = int(self.config.body_thickness * self.THICKNESS.get((start_idx, end_idx), 0.8))
-            cv2.line(layer, pt1, pt2, color_bgra, thickness, cv2.LINE_AA)
+        # Smooth edges
+        if self.config.edge_blur > 0:
+            kk = self.config.edge_blur * 2 + 1
+            mask = cv2.GaussianBlur(mask, (kk, kk), 0)
 
-        # Draw joints
-        for idx in self.JOINTS:
-            if keypoints[idx, 2] < 0.3:
-                continue
-            pt = self._to_pixel(keypoints[idx], width, height, offset)
-            cv2.circle(layer, pt, self.config.joint_radius, color_bgra, -1, cv2.LINE_AA)
+        return mask
 
-        # Draw head
-        if keypoints[0, 2] > 0.3:
-            head_pt = self._to_pixel(keypoints[0], width, height, offset)
+    def _draw_shadow(self, layer: np.ndarray, mask: np.ndarray, width: int, height: int):
+        """Draw offset blurred shadow."""
+        ox, oy = self.config.shadow_offset
+        # Shift mask for shadow
+        M = np.float32([[1, 0, ox], [0, 1, oy]])
+        shadow_mask = cv2.warpAffine(mask, M, (width, height))
 
-            # Estimate head size from ears
-            if keypoints[7, 2] > 0.3 and keypoints[8, 2] > 0.3:
-                ear_l = self._to_pixel(keypoints[7], width, height, (0, 0))
-                ear_r = self._to_pixel(keypoints[8], width, height, (0, 0))
-                ear_dist = np.sqrt((ear_l[0] - ear_r[0])**2 + (ear_l[1] - ear_r[1])**2)
-                head_w = int(ear_dist * 1.3)
-                head_h = int(ear_dist * 1.6)
-            else:
-                head_w = self.config.body_thickness * 2
-                head_h = int(self.config.body_thickness * 2.5)
+        # Heavy blur for soft shadow
+        k = self.config.shadow_blur * 2 + 1
+        shadow_mask = cv2.GaussianBlur(shadow_mask, (k, k), 0)
 
-            cv2.ellipse(layer, head_pt, (head_w // 2, head_h // 2), 0, 0, 360, color_bgra, -1, cv2.LINE_AA)
+        alpha = shadow_mask.astype(np.float32) / 255.0
+        sc = self.config.shadow_color
+        # Blend shadow into layer
+        for c, val in enumerate([sc[2], sc[1], sc[0]]):  # BGR
+            layer[:, :, c] = np.clip(
+                layer[:, :, c].astype(np.float32) + val * alpha * 0.7, 0, 255
+            ).astype(np.uint8)
+        layer[:, :, 3] = np.clip(
+            layer[:, :, 3].astype(np.float32) + alpha * 180, 0, 255
+        ).astype(np.uint8)
 
-    def _to_pixel(self, kp: np.ndarray, w: int, h: int, offset: Tuple[int, int] = (0, 0)) -> Tuple[int, int]:
-        x = int(kp[0] * w) + offset[0]
-        y = int(kp[1] * h) + offset[1]
-        return (x, y)
+    def _draw_glow(self, layer: np.ndarray, mask: np.ndarray):
+        """Draw soft outer glow around the body."""
+        k = self.config.glow_size * 2 + 1
+        glow = cv2.GaussianBlur(mask, (k, k), 0)
 
-    def _composite(self, base: np.ndarray, overlay: np.ndarray):
-        """Composite overlay onto base using alpha blending."""
-        alpha = overlay[:, :, 3:4].astype(float) / 255.0
-        base[:, :, :3] = (base[:, :, :3].astype(float) * (1 - alpha) + overlay[:, :, :3].astype(float) * alpha).astype(np.uint8)
-        base[:, :, 3] = np.clip(base[:, :, 3].astype(float) + overlay[:, :, 3].astype(float) * 0.5, 0, 255).astype(np.uint8)
+        alpha = glow.astype(np.float32) / 255.0 * self.config.glow_intensity
+        gc = self.config.glow_color
+        for c, val in enumerate([gc[2], gc[1], gc[0]]):  # BGR
+            layer[:, :, c] = np.clip(
+                layer[:, :, c].astype(np.float32) + val * alpha, 0, 255
+            ).astype(np.uint8)
+        layer[:, :, 3] = np.clip(
+            layer[:, :, 3].astype(np.float32) + alpha * 200, 0, 255
+        ).astype(np.uint8)
+
+    def _draw_body(self, layer: np.ndarray, mask: np.ndarray):
+        """Draw the solid white body from the clean mask."""
+        alpha = mask.astype(np.float32) / 255.0
+        bc = self.config.color
+        # Overwrite with body color where mask is active
+        for c, val in enumerate([bc[2], bc[1], bc[0]]):  # BGR
+            layer[:, :, c] = np.clip(
+                layer[:, :, c].astype(np.float32) * (1 - alpha) + val * alpha, 0, 255
+            ).astype(np.uint8)
+        layer[:, :, 3] = np.clip(
+            layer[:, :, 3].astype(np.float32) * (1 - alpha) + 255 * alpha, 0, 255
+        ).astype(np.uint8)

@@ -51,7 +51,7 @@ class PoseDetector:
         model_complexity: int = 1,
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
-        enable_segmentation: bool = False,
+        enable_segmentation: bool = True,
         detection_scale: float = 1.0,
     ):
         """
@@ -73,8 +73,9 @@ class PoseDetector:
         )
         self.enable_segmentation = enable_segmentation
         self.detection_scale = detection_scale
+        self._original_size = None
 
-    def detect(self, frame: np.ndarray) -> Optional[np.ndarray]:
+    def detect(self, frame: np.ndarray):
         """
         Detect pose in a frame.
 
@@ -82,32 +83,40 @@ class PoseDetector:
             frame: BGR image from OpenCV
 
         Returns:
-            Array of shape (33, 3) with [x, y, visibility] per keypoint,
-            or None if no pose detected. Coordinates are normalized [0, 1].
+            Tuple of (keypoints, segmentation_mask) where keypoints is
+            array of shape (33, 3) with [x, y, visibility] per keypoint
+            (normalized [0, 1]), and segmentation_mask is a float32 array
+            at full frame resolution (or None). Returns (None, None) if
+            no pose detected.
         """
-        # Downscale for faster processing if needed
+        h, w = frame.shape[:2]
+        self._original_size = (h, w)
+
+        process_frame = frame
         if self.detection_scale < 1.0:
-            h, w = frame.shape[:2]
             new_w = int(w * self.detection_scale)
             new_h = int(h * self.detection_scale)
-            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            process_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-        # Convert BGR to RGB for MediaPipe
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Process frame
+        rgb_frame = cv2.cvtColor(process_frame, cv2.COLOR_BGR2RGB)
         results = self.pose.process(rgb_frame)
 
         if results.pose_landmarks is None:
-            return None
+            return None, None
 
         # Extract keypoints (coordinates are already normalized 0-1)
         keypoints = np.zeros((33, 3), dtype=np.float32)
-
         for i, landmark in enumerate(results.pose_landmarks.landmark):
             keypoints[i] = [landmark.x, landmark.y, landmark.visibility]
 
-        return keypoints
+        # Extract segmentation mask and resize to original frame size
+        seg_mask = None
+        if self.enable_segmentation and results.segmentation_mask is not None:
+            seg_mask = results.segmentation_mask
+            if self.detection_scale < 1.0:
+                seg_mask = cv2.resize(seg_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        return keypoints, seg_mask
 
     def detect_with_segmentation(
         self, frame: np.ndarray

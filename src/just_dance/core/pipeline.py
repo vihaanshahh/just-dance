@@ -18,10 +18,8 @@ if sys.platform == 'darwin':
 
 from ..pose.detector import PoseDetector
 from ..pose.smoother import MotionSmoother
-from ..pose.predictor import MotionPredictor
 from ..rendering.silhouette import SilhouetteRenderer, SilhouetteConfig
 from ..rendering.glove import GloveRenderer, GloveConfig
-from ..rendering.ribbon import RibbonRenderer, RibbonConfig
 from ..rendering.compositor import Compositor, BackgroundConfig
 from .video_loader import VideoReader
 from .video_exporter import VideoWriter, ExportConfig
@@ -31,23 +29,19 @@ from .video_exporter import VideoWriter, ExportConfig
 class PipelineConfig:
     """Configuration for the processing pipeline."""
 
-    # Performance (aggressive defaults for speed)
+    # Performance
     model_complexity: int = 0  # Lite model
-    detection_scale: float = 0.4  # 40% resolution for detection
-    frame_skip: int = 3  # Detect every 3rd frame
+    detection_scale: float = 0.5  # 50% resolution for detection (need decent seg mask)
+    frame_skip: int = 1  # Detect every frame (segmentation mask needs it)
     num_workers: int = 0  # 0 = auto (cpu_count)
 
     # Smoothing
     process_noise: float = 0.01
     measurement_noise: float = 0.08
 
-    # Prediction
-    prediction_frames: int = 30
-
     # Rendering
     silhouette: SilhouetteConfig = field(default_factory=SilhouetteConfig)
     glove: GloveConfig = field(default_factory=GloveConfig)
-    ribbon: RibbonConfig = field(default_factory=RibbonConfig)
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
 
     # Export
@@ -62,50 +56,46 @@ def _process_frame_batch(args):
     detector = PoseDetector(
         model_complexity=config_dict['model_complexity'],
         detection_scale=config_dict['detection_scale'],
+        enable_segmentation=True,
     )
     smoother = MotionSmoother(
         process_noise=config_dict['process_noise'],
         measurement_noise=config_dict['measurement_noise'],
     )
-    predictor = MotionPredictor(prediction_frames=config_dict['prediction_frames'])
 
     silhouette_renderer = SilhouetteRenderer()
     glove_renderer = GloveRenderer()
-    ribbon_renderer = RibbonRenderer()
     compositor = Compositor()
 
     results = []
     frame_skip = config_dict['frame_skip']
     last_keypoints = None
+    last_seg_mask = None
 
     for i, (frame_idx, frame) in enumerate(zip(frame_indices, frames)):
         # Detect pose (with frame skipping)
         if i % frame_skip == 0 or last_keypoints is None:
-            keypoints = detector.detect(frame)
+            keypoints, seg_mask = detector.detect(frame)
             if keypoints is not None:
                 last_keypoints = keypoints
+                last_seg_mask = seg_mask
         else:
             keypoints = last_keypoints
+            seg_mask = last_seg_mask
 
         if keypoints is None:
-            # No pose - just background
             rendered = compositor.create_background(frame_size, frame)
             results.append((frame_idx, rendered))
             continue
 
-        # Smooth
+        # Smooth keypoints (for glove positioning)
         smoothed = smoother.smooth(keypoints)
-        predictor.update(smoothed)
-        predicted = predictor.predict() if i >= 5 else None
 
         # Render
-        height, width = frame_size
         background = compositor.create_background(frame_size, frame)
         layers = []
 
-        if predicted:
-            layers.append(ribbon_renderer.render(smoothed, predicted, frame_size))
-        layers.append(silhouette_renderer.render(smoothed, frame_size))
+        layers.append(silhouette_renderer.render(smoothed, frame_size, seg_mask))
         layers.append(glove_renderer.render(smoothed, frame_size, frame_idx / 30.0))
 
         rendered = compositor.composite(background, layers)
@@ -161,7 +151,6 @@ class ProcessingPipeline:
                     'frame_skip': self.config.frame_skip,
                     'process_noise': self.config.process_noise,
                     'measurement_noise': self.config.measurement_noise,
-                    'prediction_frames': self.config.prediction_frames,
                 }, frame_size))
 
             # Process batches in parallel
